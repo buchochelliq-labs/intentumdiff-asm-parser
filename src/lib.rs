@@ -81,6 +81,17 @@ fn is_trivia(kind: &str) -> bool {
     TRIVIA.contains(&kind)
 }
 
+/// True for nodes that tree-sitter's error recovery invented rather than read
+/// from the source: `MISSING` tokens and zero-width non-root nodes.
+///
+/// tree-sitter-asm cannot start a program with an empty line, so a leading blank
+/// or comment-only line makes the parser synthesize an `instruction` whose
+/// mnemonic is `MISSING word`, spanning zero bytes. Such a node holds no
+/// assembler token and must not become semantic evidence.
+fn is_synthesized(node: tree_sitter::Node<'_>) -> bool {
+    node.is_missing() || (node.start_byte() == node.end_byte() && node.parent().is_some())
+}
+
 fn is_section_like(kind: &str) -> bool {
     matches!(kind, "section" | "meta" | "segment")
 }
@@ -183,7 +194,7 @@ fn convert_ts(
     current_section: Option<&str>,
 ) -> Option<SemanticNode> {
     let kind = node.kind();
-    if is_trivia(kind) {
+    if is_trivia(kind) || is_synthesized(node) {
         return None;
     }
 
@@ -390,5 +401,88 @@ mod tests {
     fn process_impl_whitespace_returns_valid_json() {
         let out = process_impl("   \n  ");
         t::assert_valid_json(&out, "process(whitespace)");
+    }
+
+    // Regression: buchochelliq-labs/intentumdiff-asm-parser#4. Leading blank or
+    // comment-only lines must not synthesize an empty `instruction` node.
+    const BASE: &str = "section .text\nglobal answer\nanswer:\n    mov eax, 1\n    ret\n";
+
+    fn semantic_shape(src: &str) -> Vec<(String, String, String)> {
+        fn walk(v: &serde_json::Value, out: &mut Vec<(String, String, String)>) {
+            out.push((
+                v["node_type"].as_str().unwrap_or("").to_string(),
+                v["label"].as_str().unwrap_or("").to_string(),
+                v["structural_hash"].as_str().unwrap_or("").to_string(),
+            ));
+            if let Some(cs) = v["children"].as_array() {
+                for c in cs {
+                    walk(c, out);
+                }
+            }
+        }
+        let v: serde_json::Value = serde_json::from_str(&process_impl(src)).unwrap();
+        assert!(v.get("error").is_none(), "unexpected error: {v}");
+        let mut out = Vec::new();
+        walk(&v, &mut out);
+        out
+    }
+
+    fn assert_no_zero_width_or_kind_labels(src: &str) {
+        fn walk(v: &serde_json::Value, root: bool) {
+            let p = &v["position"];
+            if !root {
+                assert!(
+                    !(p["start_line"] == p["end_line"] && p["start_col"] == p["end_col"]),
+                    "zero-width node emitted: {v}"
+                );
+                assert_ne!(v["label"], v["node_type"], "kind used as label: {v}");
+            }
+            if let Some(cs) = v["children"].as_array() {
+                for c in cs {
+                    walk(c, false);
+                }
+            }
+        }
+        let v: serde_json::Value = serde_json::from_str(&process_impl(src)).unwrap();
+        walk(&v, true);
+    }
+
+    #[test]
+    fn leading_ordinary_comment_adds_no_instruction() {
+        let new = "; Ordinary assembler comment\nsection .text\nglobal answer\nanswer:\n    mov eax, 1\n    ret\n";
+        assert_no_zero_width_or_kind_labels(new);
+        assert_eq!(semantic_shape(BASE), semantic_shape(new));
+    }
+
+    #[test]
+    fn leading_and_trailing_blank_lines_add_no_instruction() {
+        let new = "\nsection .text\nglobal answer\nanswer:\n    mov eax, 1\n    ret\n\n";
+        assert_no_zero_width_or_kind_labels(new);
+        assert_eq!(semantic_shape(BASE), semantic_shape(new));
+    }
+
+    #[test]
+    fn other_comment_and_blank_layouts_add_no_instruction() {
+        for new in [
+            "\n\n\nsection .text\nglobal answer\nanswer:\n    mov eax, 1\n    ret\n",
+            "    ; indented comment\nsection .text\nglobal answer\nanswer:\n    mov eax, 1\n    ret\n",
+            "section .text\nglobal answer\n\n; mid comment\n\nanswer:\n    mov eax, 1 ; trailing\n    ret\n",
+        ] {
+            assert_no_zero_width_or_kind_labels(new);
+            assert_eq!(semantic_shape(BASE), semantic_shape(new), "source: {new:?}");
+        }
+    }
+
+    #[test]
+    fn real_instruction_edits_still_change_the_tree() {
+        // Operand text is enriched by core from the byte-exact span; the parser
+        // tree must at least keep the mnemonic and the real instruction spans.
+        let changed_op = "\nsection .text\nglobal answer\nanswer:\n    add eax, 1\n    ret\n";
+        assert_ne!(semantic_shape(BASE), semantic_shape(changed_op));
+        let v: serde_json::Value = serde_json::from_str(&process_impl(changed_op)).unwrap();
+        let first = &v["children"][0];
+        assert_eq!(first["label"], "section");
+        assert_eq!(first["position"]["start_line"], 1);
+        assert_eq!(first["position"]["end_col"], 13);
     }
 }
